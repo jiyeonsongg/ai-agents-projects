@@ -3,7 +3,7 @@ revision = 3
 requires-python = ">=3.13"
 
 [[package]]
-name = "2-first-ai-response"
+name = "2-5-movie-agent"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
