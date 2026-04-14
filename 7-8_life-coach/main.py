@@ -10,12 +10,7 @@ from agents import (
     Runner,
     SQLiteSession,
     WebSearchTool,
-    FileSearchTool,
-    # ImageGenerationTool,
-    # CodeInterpreterTool,
-    # HostedMCPTool,
 )
-# from agents.mcp.server import MCPServerStdio
 
 client = OpenAI()
 
@@ -50,24 +45,9 @@ async def paint_history():
             if message_type == "web_search_call":
                 with st.chat_message("ai"):
                     st.write("🔍 Searched the web...")
-            elif message_type == "file_search_call":
-                with st.chat_message("ai"):
-                    st.write("🗂️ Searched your files...")
-            # elif message_type == "image_generation_call":
-            #     image = base64.b64decode(message["result"])
+            # elif message_type == "file_search_call":
             #     with st.chat_message("ai"):
-            #         st.image(image)
-            # elif message_type == "code_interpreter_call":
-            #     with st.chat_message("ai"):
-            #         st.code(message["code"])
-            # elif message_type == "mcp_list_tools":
-            #     with st.chat_message("ai"):
-            #         st.write(f"Listed {message['server_label']}'s tools")
-            # elif message_type == "mcp_call":
-            #     with st.chat_message("ai"):
-            #         st.write(
-            #             f"Called {message['server_label']}'s {message['name']} with args {message['arguments']}"
-            #         )
+            #         st.write("🗂️ Searched your files...")
 
 
 asyncio.run(paint_history())
@@ -85,64 +65,16 @@ def update_status(status_container, event):
             "🔍 Web search in progress...",
             "running",
         ),
-        "response.file_search_call.completed": (
-            "✅ File search completed.",
-            "complete",
-        ),
-        "response.file_search_call.in_progress": (
-            "🗂️ Starting file search...",
-            "running",
-        ),
-        "response.file_search_call.searching": (
-            "🗂️ File search in progress...",
-            "running",
-        ),
-        # "response.image_generation_call.generating": (
-        #     "🎨 Drawing image...",
+        # "response.file_search_call.completed": (
+        #     "✅ File search completed.",
+        #     "complete",
+        # ),
+        # "response.file_search_call.in_progress": (
+        #     "🗂️ Starting file search...",
         #     "running",
         # ),
-        # "response.image_generation_call.in_progress": (
-        #     "🎨 Drawing image...",
-        #     "running",
-        # ),
-        # "response.code_interpreter_call_code.done": (
-        #     "🤖 Ran code.",
-        #     "complete",
-        # ),
-        # "response.code_interpreter_call.completed": (
-        #     "🤖 Ran code.",
-        #     "complete",
-        # ),
-        # "response.code_interpreter_call.in_progress": (
-        #     "🤖 Running code...",
-        #     "complete",
-        # ),
-        # "response.code_interpreter_call.interpreting": (
-        #     "🤖 Running code...",
-        #     "complete",
-        # ),
-        # "response.mcp_call.completed": (
-        #     "⚒️ Called MCP tool",
-        #     "complete",
-        # ),
-        # "response.mcp_call.failed": (
-        #     "⚒️ Error calling MCP tool",
-        #     "complete",
-        # ),
-        # "response.mcp_call.in_progress": (
-        #     "⚒️ Calling MCP tool...",
-        #     "running",
-        # ),
-        # "response.mcp_list_tools.completed": (
-        #     "⚒️ Listed MCP tools",
-        #     "complete",
-        # ),
-        # "response.mcp_list_tools.failed": (
-        #     "⚒️ Error listing MCP tools",
-        #     "complete",
-        # ),
-        # "response.mcp_list_tools.in_progress": (
-        #     "⚒️ Listing MCP tools",
+        # "response.file_search_call.searching": (
+        #     "🗂️ File search in progress...",
         #     "running",
         # ),
         "response.completed": (" ", "complete"),
@@ -154,13 +86,6 @@ def update_status(status_container, event):
 
 
 async def run_agent(message):
-    # yfinance_server = MCPServerStdio(
-    #     params={
-    #         "command": "uvx",
-    #         "args": ["mcp-yahoo-finance"],
-    #     },
-    #     cache_tools_list=True,
-    # )
 
     timezone_server = MCPServerStdio(
         params={
@@ -189,31 +114,6 @@ async def run_agent(message):
                 # FileSearchTool(
                 #     vector_store_ids=[VECTOR_STORE_ID],
                 #     max_num_results=3,
-                # ),
-                # ImageGenerationTool(
-                #     tool_config={
-                #         "type": "image_generation",
-                #         "quality": "high",
-                #         "output_format": "jpeg",
-                #         "partial_images": 1,
-                #     }
-                # ),
-                # CodeInterpreterTool(
-                #     tool_config={
-                #         "type": "code_interpreter",
-                #         "container": {
-                #             "type": "auto",
-                #         },
-                #     }
-                # ),
-                # HostedMCPTool(
-                #     tool_config={
-                #         "server_url": "https://mcp.context7.com/mcp",
-                #         "type": "mcp",
-                #         "server_label": "Context7",
-                #         "server_description": "Use this to get the docs from software projects.",
-                #         "require_approval": "never",
-                #     }
                 # ),
             ],
         )
