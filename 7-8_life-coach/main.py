@@ -1,10 +1,14 @@
 import asyncio
+import base64
 import os
 import tempfile
+from io import BytesIO
+
 import streamlit as st
 from agents import (
     Agent,
     FileSearchTool,
+    ImageGenerationTool,
     Runner,
     SQLiteSession,
     WebSearchTool,
@@ -37,6 +41,10 @@ if "indexed_files_fingerprint" not in st.session_state:
     st.session_state["indexed_files_fingerprint"] = ""
 
 client: OpenAI = st.session_state["openai_client"]
+
+
+def image_from_b64(b64_data: str) -> BytesIO:
+    return BytesIO(base64.b64decode(b64_data))
 
 
 def get_or_create_vector_store_id() -> str:
@@ -75,7 +83,18 @@ def index_uploaded_files(uploaded_files) -> tuple[int, str]:
 
 
 def build_agent() -> Agent:
-    tools = [WebSearchTool()]
+    tools = [
+        WebSearchTool(),
+        ImageGenerationTool(
+            tool_config={
+                "type": "image_generation",
+                "model": "gpt-image-1",
+                "quality": "high",
+                "size": "1536x1024",
+                "partial_images": 3,
+            }
+        ),
+    ]
     vector_store_id = st.session_state.get("planner_vector_store_id")
     if vector_store_id:
         tools.append(
@@ -86,14 +105,25 @@ def build_agent() -> Agent:
         )
     return Agent(
         name="Life Coach Agent",
+        model="gpt-5",
         instructions=(
-            "You are a helpful life coach and assistant.\n"
-            "If planner files are indexed, use FileSearchTool to retrieve relevant planner "
-            "details before giving advice.\n"
-            "Use web search when the user asks for up-to-date information or sources.\n"
-            "When you use web search, summarize clearly and cite where the info came from.\n"
-            "Personalize advice by referencing previous user messages and your prior advice "
-            "from this ongoing chat memory."
+            "You are a helpful life coach and assistant.\n\n"
+            "Tools and when to use them:\n"
+            "- FileSearchTool: When planner or diary files are indexed, search them first for "
+            "the user's stated goals, habits, constraints, and past reflections. Ground your "
+            "coaching in what they actually wrote.\n"
+            "- WebSearchTool: Use for current tips, research-backed advice, examples, or "
+            "motivational content from the wider world. Summarize clearly and cite sources.\n"
+            "- ImageGenerationTool: Use when the user wants a visual—especially a goals-oriented "
+            "vision board or a motivational message poster. Before generating, briefly align on "
+            "their goal (or infer from context and FileSearchTool). Craft a single detailed "
+            "image prompt: layout, colors, typography style for any text on the poster, symbols "
+            "that match their goal, and mood (uplifting, calm, bold). For vision boards, describe "
+            "a clear collage or grid with distinct zones per goal. For posters, include the "
+            "exact short headline or quote they want (or you propose one sentence max). "
+            "Generate one image per request unless they explicitly ask for multiple.\n\n"
+            "Personalize advice using this chat and prior assistant turns. After generating an "
+            "image, briefly explain how it reflects their goals; do not repeat the full prompt."
         ),
         tools=tools,
     )
@@ -155,6 +185,7 @@ async def run_agent(message):
     with st.chat_message("assistant"):
         status = st.status("Thinking…", expanded=False)
         text_placeholder = st.empty()
+        image_area = st.empty()
         response_text = ""
 
         memory_context = await build_memory_context()
@@ -190,15 +221,39 @@ async def run_agent(message):
                 "response.web_search_call.in_progress",
                 "response.web_search_call.searching",
             ):
-                status.update(label="Searching the web…", state="running")
+                status.update(label="📲Searching the web…", state="running")
             elif "file_search_call" in event_type and (
                 "in_progress" in event_type or "searching" in event_type
             ):
-                status.update(label="Searching planner file…", state="running")
+                status.update(label="👓Searching planner file…", state="running")
             elif "file_search_call" in event_type and "completed" in event_type:
-                status.update(label="Planner file search completed.", state="running")
+                status.update(label="🪄Planner file search completed.", state="running")
             elif event_type == "response.web_search_call.completed":
-                status.update(label="Web search completed.", state="complete")
+                status.update(label="🪄Web search completed.", state="complete")
+            elif event_type in (
+                "response.image_generation_call.in_progress",
+                "response.image_generation_call.generating",
+            ):
+                status.update(label="🎰Generating image…", state="running")
+            elif event_type == "response.image_generation_call.partial_image":
+                status.update(label="🎰Generating image…", state="running")
+                b64 = getattr(event.data, "partial_image_b64", "") or ""
+                if b64:
+                    try:
+                        image_area.image(image_from_b64(b64))
+                    except (ValueError, OSError):
+                        pass
+            elif event_type == "response.image_generation_call.completed":
+                status.update(label="🪄Image generation finished.", state="running")
+            elif event_type == "response.output_item.done":
+                item = getattr(event.data, "item", None)
+                if item is not None and getattr(item, "type", None) == "image_generation_call":
+                    result = getattr(item, "result", None)
+                    if result:
+                        try:
+                            image_area.image(image_from_b64(result))
+                        except (ValueError, OSError):
+                            pass
             elif event_type == "response.completed":
                 status.update(label="Done.", state="complete")
 
