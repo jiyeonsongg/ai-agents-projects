@@ -7,7 +7,14 @@ class UserAccountContext(BaseModel):
     customer_id: int
     name: str
     tier: str = "basic"
-    email: Optional[str] = None  # premium entreprise
+    email: Optional[str] = None
+
+    def is_premium_customer(self) -> bool:
+        t = (self.tier or "").lower()
+        return t not in ("basic", "standard", "")
+
+    def add_troubleshooting_step(self, step: str) -> None:
+        pass
 
 
 class InputGuardRailOutput(BaseModel):
@@ -16,11 +23,10 @@ class InputGuardRailOutput(BaseModel):
     reason: str
 
 
-class TechnicalOutputGuardRailOutput(BaseModel):
+class RestaurantOutputGuardRailOutput(BaseModel):
 
-    contains_off_topic: bool
-    contains_billing_data: bool
-    contains_account_data: bool
+    contains_inappropriate: bool
+    contains_off_topic_for_agent: bool
     reason: str
 
 
