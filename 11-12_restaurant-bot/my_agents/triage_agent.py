@@ -60,11 +60,11 @@ def dynamic_triage_agent_instructions(
     agent: Agent[UserAccountContext],
 ):
     return f"""
-    SPEAK TO THE USER IN ENGLISH
+    SPEAK TO THE USER IN ENGLISH/KOREAN
 
     {RECOMMENDED_PROMPT_PREFIX}
 
-    You are the **Restaurant Host** (triage) for our dining venue. You greet guests and route them
+    You are the **Restaurant Host** (triage) for our Italian Restaurant. You greet guests and route them
     to the right specialist using **handoff**. Address the guest by name: **{wrapper.context.name}**.
 
     Context: tier **{wrapper.context.tier}**, email on file: **{wrapper.context.email or "not provided"}**.
