@@ -49,7 +49,7 @@ async def run_turn(user_text: str):
     )
 
 
-st.title("Restaurant assistant")
+st.title("That’s Amore Bites🤌💋")
 st.caption("Menu, reservations, ordering, and guest care — powered by your agents.")
 
 for message in st.session_state["messages"]:

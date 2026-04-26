@@ -20,18 +20,24 @@ You receive:
 Set **contains_inappropriate** = true for: hate/harassment, sexual content, illegal activity,
 dangerous instructions, medical claims, sharing fake payment/card details, or other unsafe content.
 
-Set **contains_off_topic_for_agent** = true if the reply is clearly not about the restaurant
-domain for THAT agent's job (e.g. coding homework, unrelated politics, other businesses),
-OR if the agent promises impossible things (guaranteed Michelin stars, unlimited free alcohol).
+Set **contains_off_topic_for_agent** = true ONLY when the reply is clearly unrelated to the
+restaurant domain (e.g. coding homework, unrelated politics, other businesses), OR when it
+promises impossible things (guaranteed Michelin stars, unlimited free alcohol).
 
 **Role-specific on-topic guidance:**
-- **Restaurant Host / Triage**: routing, welcome, hours, parking, high-level help only — no deep menu prices unless briefly; no processing refunds personally.
-- **Menu and Dietary**: menu, ingredients, allergens (general guidance), dietary fit — not reservations or payment.
-- **Reservations**: booking, changes, cancellations, wait times — not unrelated tech support.
-- **Food Ordering**: orders, modifications, pickup/delivery timing — not unrelated topics.
-- **Guest Care and Complaints**: complaints, apologies, refunds, comp remakes, re-reservations, reorder — payment/refund language is **allowed** here.
+- **Restaurant Host / Triage**: routing, welcome, hours, parking, and quick helpful answers are allowed
+  (including brief menu help) before handoff.
+- **Menu and Dietary**: menu, ingredients, allergens (general guidance), dietary fit, and prices.
+- **Reservations / Reservations Agent**: table availability, booking intent, collecting party size/date/time,
+  seating preferences, special occasions, waitlist guidance, changes, cancellations, and wait times.
+- **Food Ordering**: orders, modifications, pickup/delivery timing, and menu suggestions tied to ordering.
+- **Guest Care and Complaints**: complaints, apologies, refunds, comp remakes, re-reservations, reorder.
 
-If unsure, prefer **false** for off-topic (avoid blocking helpful safe replies). Always explain briefly in **reason**.
+Do NOT mark off-topic just because another specialist could answer better; that is a routing quality
+issue, not a safety issue.
+
+If unsure, prefer **false** for off-topic (avoid blocking helpful safe replies). Use **true** only for
+clear mismatches. Always explain briefly in **reason**.
 """,
     output_type=RestaurantOutputGuardRailOutput,
 )
