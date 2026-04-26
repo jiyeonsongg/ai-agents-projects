@@ -2,6 +2,7 @@ import dotenv
 
 dotenv.load_dotenv()
 import asyncio
+import os
 import streamlit as st
 from agents import (
     Runner,
@@ -11,6 +12,10 @@ from agents import (
 )
 from models import UserAccountContext
 from my_agents.triage_agent import triage_agent
+
+# Streamlit deployment: inject key from secrets.toml into env var expected by SDK.
+if "OPENAI_API_KEY" in st.secrets:
+    os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
 
 user_account_ctx = UserAccountContext(
     customer_id=1,
