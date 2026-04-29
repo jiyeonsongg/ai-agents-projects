@@ -1,0 +1,5 @@
+Image was not returned by model.
+Model: gemini-2.5-flash-image-preview
+Page: 5
+Prompt: Create a colorful, child-friendly storybook illustration. Soft shapes, warm light, no text on image. Scene: Pip the mouse fast asleep under the oak tree, with gentle dream bubbles showing sleeping forest animals (squirrel, bird). A twinkling star in the sky.
+Error: 404 NOT_FOUND. {'error': {'code': 404, 'message': 'models/gemini-2.5-flash-image-preview is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods.', 'status': 'NOT_FOUND'}}
