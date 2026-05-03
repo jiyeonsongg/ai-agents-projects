@@ -2,20 +2,79 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import re
 from base64 import b64decode
-from typing import Any, AsyncGenerator
+from typing import Any, AsyncGenerator, Literal
 
 import requests
 from google.adk.agents import BaseAgent, Context, LlmAgent, ParallelAgent, SequentialAgent
 from google.adk.agents.callback_context import CallbackContext
 from google.adk.agents.invocation_context import InvocationContext
+from google.adk.agents.readonly_context import ReadonlyContext
 from google.adk.events.event import Event
+from google.adk.events.event_actions import EventActions
 from google.adk.models.llm_response import LlmResponse
+from google.adk.utils.context_utils import Aclosing
 from google.genai import Client, types
 from pydantic import BaseModel, Field
 from typing_extensions import override
+
+# Session keys for the user's creative brief (set by BookMakerHostAgent before the pipeline runs).
+STATE_USER_THEME = "story_user_theme"
+STATE_USER_BRIEF = "story_user_brief"
+
+_INTAKE_PROMPT = """Welcome to the Story Book Maker.
+
+I'll turn your ideas into a **5-page illustrated children's story**.
+
+Please send:
+
+1. **Theme** — what the story is about (e.g. friendship, space, kindness).
+2. **Brief story idea** — a short description of what happens.
+
+You can send everything in **one message**, for example:
+
+**Theme:** a curious robot in a garden  
+**Brief:** The robot finds a tiny seed and learns to care for it until it blooms.
+
+Or send your **theme** first; I'll ask for your story idea next."""
+
+# Shorter "how to send your brief" — used after `_CAPABILITIES_REPLY` so we do not repeat the welcome / 5-page pitch.
+_INTAKE_HOW_TO_FORMAT = """**How to start**
+
+Send:
+
+1. **Theme** — what the story is about (e.g. friendship, space, kindness).
+2. **Brief story idea** — what happens, in a few sentences.
+
+**Example (one message):**
+
+**Theme:** a curious robot in a garden  
+**Brief:** The robot finds a tiny seed and learns to care for it until it blooms.
+
+Or send your **theme** first; I'll ask for your story idea next."""
+
+_CAPABILITIES_REPLY = """Here is what I can do:
+
+I am a **children's story book maker**. After you send a **theme** and **brief story idea**, I:
+
+- Write a **5-page** children's story (short, age-appropriate text).
+- Create a **matching illustration for each page**.
+
+"""
+
+_GUARDRAIL_OUT_OF_SCOPE = (
+    "That doesn’t look like **storybook input** for this app. I only help you make a **children’s picture book**: "
+    "you share a **theme** (what the fictional story is about) and a **brief story idea** (what happens), "
+    "then I write **5 short pages** with **one illustration each**.\n\n"
+    "Please send creative input for a **made-up kids’ story**, not general tasks, chat, or unrelated questions.\n\n"
+    "**Example:**\n\n"
+    "**Theme:** brave mice in a bakery  \n"
+    "**Brief:** They team up to save the last cinnamon roll before the shop opens.\n"
+)
 
 
 class StoryPage(BaseModel):
@@ -27,6 +86,297 @@ class StoryPage(BaseModel):
 class StoryPlan(BaseModel):
     title: str = Field(description="Title of the children's story.")
     pages: list[StoryPage] = Field(description="Exactly 5 pages for the story.")
+
+
+def _user_text_from_content(user_content: types.Content | None) -> str:
+    if not user_content or not user_content.parts:
+        return ""
+    return "".join(
+        part.text or "" for part in user_content.parts if part.text and not part.thought
+    ).strip()
+
+
+def _parse_labeled_theme_brief(text: str) -> tuple[str | None, str | None]:
+    """Parse lines like `Theme: ...` and `Brief:` / `Idea:` / `Story idea:`."""
+    if not text.strip():
+        return None, None
+    theme_m = re.search(
+        r"(?is)(?:^|\n)\s*(?:theme|topic)\s*:\s*(.+?)(?=(?:^|\n)\s*(?:brief|story\s*idea|idea)\s*:|$)",
+        text,
+    )
+    brief_m = re.search(r"(?is)(?:^|\n)\s*(?:brief|story\s*idea|idea)\s*:\s*(.+)$", text)
+    theme = theme_m.group(1).strip() if theme_m else None
+    brief = brief_m.group(1).strip() if brief_m else None
+    if theme and not brief:
+        tail = text[theme_m.end() :].strip() if theme_m else ""
+        if tail and not re.match(r"(?is)^\s*(?:brief|story\s*idea|idea)\s*:", tail):
+            brief = tail
+    return theme, brief
+
+
+def _split_two_blocks(text: str) -> tuple[str | None, str | None]:
+    """Split on a blank line into theme-like and brief-like blocks."""
+    parts = [p.strip() for p in re.split(r"\n\s*\n", text.strip()) if p.strip()]
+    if len(parts) >= 2:
+        return parts[0], parts[1]
+    return None, None
+
+
+def _is_small_talk(text: str) -> bool:
+    t = text.strip().lower()
+    if len(t) < 2:
+        return True
+    return bool(
+        re.fullmatch(
+            r"(hi+|hello+|hey+|yo+|start|go|ok|yes|thanks+|thank you|thx|cool|great|nice|awesome)[\s!.?]*",
+            t,
+        )
+    )
+
+
+def _is_meta_or_help_question(text: str) -> bool:
+    """True if the user is asking what the agent does / how it works, not giving a story theme."""
+    t = text.strip().lower()
+    if not t:
+        return False
+    patterns = (
+        r"what\s+can\s+you\s+do",
+        r"what\s+do\s+you\s+do",
+        r"what\s+are\s+you",
+        r"who\s+are\s+you",
+        r"what\s+can\s+this\s+do",
+        r"how\s+does\s+(this|it)\s+work",
+        r"how\s+do\s+you\s+work",
+        r"what\s+do\s+you\s+offer",
+        r"what\s+happens\s+here",
+        r"tell\s+me\s+about\s+(yourself|this)",
+        r"\bhelp\b(?:\s*!)?\s*$",
+        r"\b(capabilities|features)\b.*\b(you|this)\b",
+        r"\bhow\s+to\s+use\b",
+        r"what\s+is\s+this",
+        r"what\s+are\s+you\s+for",
+    )
+    return any(re.search(p, t) for p in patterns)
+
+
+def _parse_intake_gate_json(raw: str) -> bool | None:
+    """Parse model JSON `{\"allowed\": true|false}`. Returns None if invalid."""
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```\s*$", "", text)
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict) and "allowed" in obj:
+            return bool(obj["allowed"])
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+    return None
+
+
+def _build_intake_gate_prompt(
+    user_text: str,
+    mode: Literal["theme_or_full", "brief_only"],
+    saved_theme: str,
+) -> str:
+    rules = """You validate messages for a children's PICTURE-BOOK app.
+
+The app ONLY accepts creative input for a fictional children's story:
+1) **Theme** — what the story is about (topic, mood, world, age-appropriate subject).
+2) **Brief story idea** — what happens in that story (characters, problem, events). It must be about a made-up kids' tale, not real-world errands or services.
+
+ALLOW (allowed: true) ONLY when the user is clearly supplying or refining content for inventing a children's story (theme and/or plot).
+
+REJECT (allowed: false) for ANYTHING else, including: shopping, chores, homework, coding, email, calendars, travel booking, medical/legal/financial advice, news, politics, general chat, insults, unrelated Q&A, requests for the assistant that are not story creation, or text that is not about a fictional children's book.
+
+Short greetings alone are not handled here. If a message mixes a small hello with a real theme/brief, ALLOW when the story part is clear."""
+
+    if mode == "brief_only":
+        return (
+            f"{rules}\n\n"
+            f"A **theme** is already saved (context only): {saved_theme!r}\n\n"
+            "The user's NEW message must be ONLY a **brief fictional story idea** (what happens in the book). "
+            "If it is an unrelated request or not a plot description, REJECT.\n\n"
+            f'User message:\n"""\n{user_text}\n"""\n\n'
+            'Reply with JSON only, no markdown: {"allowed": true} or {"allowed": false}'
+        )
+
+    return (
+        f"{rules}\n\n"
+        f'User message (may include Theme:/Brief: labels or freeform):\n"""\n{user_text}\n"""\n\n'
+        'Reply with JSON only, no markdown: {"allowed": true} or {"allowed": false}'
+    )
+
+
+def _sync_llm_intake_gate_allow(
+    user_text: str,
+    mode: Literal["theme_or_full", "brief_only"],
+    saved_theme: str,
+) -> bool:
+    """Classifier: True only if message is on-topic for storybook intake.
+
+    Fails closed on model errors. If ``GOOGLE_API_KEY`` is unset, the gate is skipped
+    (returns True) so local runs without Gemini are not blocked.
+    """
+    if not user_text.strip():
+        return False
+    if not os.getenv("GOOGLE_API_KEY", "").strip():
+        return True
+    model = os.getenv("BOOK_MAKER_INTAKE_GATE_MODEL", "gemini-2.5-flash").strip()
+    prompt = _build_intake_gate_prompt(user_text, mode, saved_theme)
+    try:
+        client = Client()
+        response = client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config=types.GenerateContentConfig(temperature=0.0),
+        )
+    except Exception:
+        return False
+
+    raw_parts: list[str] = []
+    for cand in response.candidates or []:
+        content = getattr(cand, "content", None)
+        if not content:
+            continue
+        for part in content.parts or []:
+            if part.text and not part.thought:
+                raw_parts.append(part.text)
+    raw = "".join(raw_parts).strip()
+    parsed = _parse_intake_gate_json(raw)
+    return parsed is True
+
+
+async def _llm_intake_gate_allow(
+    user_text: str,
+    *,
+    mode: Literal["theme_or_full", "brief_only"],
+    saved_theme: str = "",
+) -> bool:
+    return await asyncio.to_thread(_sync_llm_intake_gate_allow, user_text, mode, saved_theme)
+
+
+async def _apply_intake_from_message(tc: Context, user_text: str) -> tuple[bool, str]:
+    """Update session state from the user's message.
+
+    Returns:
+        (ready_to_run_book_pipeline, reply_text_if_not_ready).
+        When not ready, reply_text is shown to the user (intake continues).
+    """
+    theme_in = (tc.state.get(STATE_USER_THEME) or "").strip()
+    brief_in = (tc.state.get(STATE_USER_BRIEF) or "").strip()
+
+    if theme_in and brief_in:
+        lt, lb = _parse_labeled_theme_brief(user_text)
+        if lt and lb:
+            if not await _llm_intake_gate_allow(user_text, mode="theme_or_full", saved_theme=""):
+                return False, _GUARDRAIL_OUT_OF_SCOPE
+            tc.state[STATE_USER_THEME] = lt
+            tc.state[STATE_USER_BRIEF] = lb
+            return True, ""
+        if _is_small_talk(user_text):
+            return (
+                False,
+                "When you're ready for another book, send your **theme** and **brief story idea** again.",
+            )
+        return True, ""
+
+    lt, lb = _parse_labeled_theme_brief(user_text)
+    if lt and lb:
+        if not await _llm_intake_gate_allow(user_text, mode="theme_or_full", saved_theme=""):
+            return False, _GUARDRAIL_OUT_OF_SCOPE
+        tc.state[STATE_USER_THEME] = lt
+        tc.state[STATE_USER_BRIEF] = lb
+        return True, ""
+
+    if lt and not lb:
+        if not await _llm_intake_gate_allow(user_text, mode="theme_or_full", saved_theme=""):
+            return False, _GUARDRAIL_OUT_OF_SCOPE
+        tc.state[STATE_USER_THEME] = lt
+        preview = lt[:90] + ("…" if len(lt) > 90 else "")
+        return (
+            False,
+            f"I've noted your **theme**: {preview}\n\n"
+            "Now please send your **brief story idea** — what happens in the story?",
+        )
+
+    bt, bb = _split_two_blocks(user_text)
+    if bt and bb and len(user_text) >= 20:
+        if not await _llm_intake_gate_allow(user_text, mode="theme_or_full", saved_theme=""):
+            return False, _GUARDRAIL_OUT_OF_SCOPE
+        tc.state[STATE_USER_THEME] = bt
+        tc.state[STATE_USER_BRIEF] = bb
+        return True, ""
+
+    if theme_in and not brief_in:
+        if _is_meta_or_help_question(user_text):
+            if _is_meta_or_help_question(theme_in):
+                tc.state[STATE_USER_THEME] = ""
+                tc.state[STATE_USER_BRIEF] = ""
+                return False, _CAPABILITIES_REPLY + _INTAKE_HOW_TO_FORMAT
+            preview = theme_in[:90] + ("…" if len(theme_in) > 90 else "")
+            return (
+                False,
+                _CAPABILITIES_REPLY
+                + f"I already have this **theme** saved: {preview}\n\n"
+                "Send your **brief story idea** next — what happens in the story?",
+            )
+        if not await _llm_intake_gate_allow(
+            user_text, mode="brief_only", saved_theme=theme_in
+        ):
+            return (
+                False,
+                _GUARDRAIL_OUT_OF_SCOPE
+                + "\n\nPlease send a **brief story idea** for the theme you already chose — "
+                "what happens in the book? (A few sentences about characters and events.)",
+            )
+        tc.state[STATE_USER_BRIEF] = user_text.strip()
+        return True, ""
+
+    if not theme_in:
+        if _is_meta_or_help_question(user_text):
+            return False, _CAPABILITIES_REPLY + _INTAKE_HOW_TO_FORMAT
+        if _is_small_talk(user_text):
+            return False, _INTAKE_PROMPT
+        lines = [ln.strip() for ln in user_text.split("\n") if ln.strip()]
+        if len(lines) >= 2 and len(user_text) >= 30:
+            if not await _llm_intake_gate_allow(user_text, mode="theme_or_full", saved_theme=""):
+                return False, _GUARDRAIL_OUT_OF_SCOPE
+            tc.state[STATE_USER_THEME] = lines[0]
+            tc.state[STATE_USER_BRIEF] = "\n".join(lines[1:])
+            return True, ""
+        if user_text.strip():
+            if not await _llm_intake_gate_allow(user_text, mode="theme_or_full", saved_theme=""):
+                return False, _GUARDRAIL_OUT_OF_SCOPE
+            tc.state[STATE_USER_THEME] = user_text.strip()
+            preview = user_text.strip()
+            if len(preview) > 90:
+                preview = preview[:87] + "…"
+            return (
+                False,
+                f"I've saved your **theme**: {preview}\n\n"
+                "Now please send your **brief story idea** — what happens in the story? "
+                "(A few sentences is enough.)",
+            )
+        return False, _INTAKE_PROMPT
+
+    return False, _INTAKE_PROMPT
+
+
+async def _story_writer_instruction(ctx: ReadonlyContext) -> str:
+    theme = (ctx.state.get(STATE_USER_THEME) or "").strip() or "(not provided)"
+    brief = (ctx.state.get(STATE_USER_BRIEF) or "").strip() or "(not provided)"
+    return (
+        "You are a children's story writer.\n"
+        f"The reader chose this **theme**: {theme}\n"
+        f"Their **brief story idea** (what should happen): {brief}\n\n"
+        "Produce a story plan with EXACTLY 5 pages based only on that theme and brief.\n"
+        "Each page must include:\n"
+        "- page_number (1..5)\n"
+        "- text (1-2 short child-friendly sentences)\n"
+        "- visual (a concise illustration prompt)\n"
+        "Keep tone positive and age-appropriate."
+    )
 
 
 def _generate_openai_image_bytes(prompt: str, image_model: str) -> tuple[bytes | None, str | None]:
@@ -329,38 +679,83 @@ class AssembleBookAgent(BaseAgent):
         illustrations.sort(key=lambda x: x.get("page_number", 0))
         tc.state["illustrations"] = illustrations
 
-        lines: list[str] = [
-            f"# {story_plan.get('title', 'Untitled')}",
-            "",
-            "Here is your storybook: each section has the page text and the matching image artifact.",
-            "",
-        ]
+        title = story_plan.get("title", "Untitled")
+        header = (
+            f"# {title}\n\n"
+            "Below is your **5-page storybook**. Each **following message** is one page: "
+            "story text plus its illustration (so every image shows in the chat).\n"
+        )
         by_page = {p.get("page_number"): p for p in story_plan.get("pages", [])}
-        for ill in illustrations:
-            pn = ill.get("page_number")
-            page_text = by_page.get(pn, {}).get("text", "") if by_page else ""
-            fn = ill.get("filename", "(none)")
-            lines.append(f"## Page {pn}")
-            lines.append("")
-            lines.append(f"**Text:** {page_text}")
-            lines.append("")
-            lines.append(f"**Image artifact:** `{fn}` — open it from the Artifacts panel.")
-            lines.append("")
 
-        book_markdown = "\n".join(lines).strip()
+        book_markdown = "\n\n".join(
+            [header]
+            + [
+                f"## Page {ill.get('page_number')}\n**Story text:**\n"
+                f"{by_page.get(ill.get('page_number'), {}).get('text', '')}\n**Image:** `{ill.get('filename')}`"
+                for ill in illustrations
+            ]
+        ).strip()
         tc.state["story_book_markdown"] = book_markdown
         tc.state["pipeline_progress"] = "Done — your storybook is ready."
+        tc.state[STATE_USER_THEME] = ""
+        tc.state[STATE_USER_BRIEF] = ""
 
+        # One Event per page: many UIs only render the last image if several image
+        # parts are bundled in a single message. Separate events preserve each illustration.
         yield Event(
             invocation_id=ctx.invocation_id,
             author=self.name,
             branch=ctx.branch,
-            content=types.Content(
-                role="model",
-                parts=[types.Part(text=book_markdown)],
-            ),
-            actions=tc.actions,
+            content=types.Content(role="model", parts=[types.Part(text=header)]),
+            actions=EventActions(),
         )
+
+        n_pages = len(illustrations)
+        for idx, ill in enumerate(illustrations):
+            pn = ill.get("page_number")
+            page_text = by_page.get(pn, {}).get("text", "") if by_page else ""
+            fn = ill.get("filename", "")
+            parts_page: list[types.Part] = [
+                types.Part(text=f"## Page {pn}\n\n**Story text:**\n{page_text}\n"),
+            ]
+            if fn.endswith(".png"):
+                try:
+                    loaded = await tc.load_artifact(fn)
+                except Exception:
+                    loaded = None
+                if loaded and getattr(loaded, "inline_data", None):
+                    idata = loaded.inline_data
+                    parts_page.append(
+                        types.Part(
+                            inline_data=types.Blob(
+                                mime_type=idata.mime_type or "image/png",
+                                data=idata.data,
+                            )
+                        )
+                    )
+                elif loaded and getattr(loaded, "file_data", None):
+                    parts_page.append(loaded)
+                else:
+                    parts_page.append(
+                        types.Part(
+                            text=f"*(Illustration `{fn}` — open it from the Artifacts panel.)*\n"
+                        )
+                    )
+            elif fn.endswith(".txt"):
+                parts_page.append(
+                    types.Part(
+                        text=f"*(Page {pn} image unavailable; see artifact `{fn}` for details.)*\n"
+                    )
+                )
+
+            is_last = idx == n_pages - 1
+            yield Event(
+                invocation_id=ctx.invocation_id,
+                author=self.name,
+                branch=ctx.branch,
+                content=types.Content(role="model", parts=parts_page),
+                actions=tc.actions if is_last else EventActions(),
+            )
 
 
 def _page_agents() -> list[IllustratePageAgent]:
@@ -378,16 +773,8 @@ def _page_agents() -> list[IllustratePageAgent]:
 story_writer_agent = LlmAgent(
     name="story_writer_agent",
     model="gemini-2.5-flash",
-    description="Writes a 5-page children's story plan from a user theme.",
-    instruction=(
-        "You are a children's story writer.\n"
-        "Read the user's theme and produce a story plan with EXACTLY 5 pages.\n"
-        "Each page must include:\n"
-        "- page_number (1..5)\n"
-        "- text (1-2 short child-friendly sentences)\n"
-        "- visual (a concise illustration prompt)\n"
-        "Keep tone positive and age-appropriate."
-    ),
+    description="Writes a 5-page children's story plan from the user's theme and brief in session state.",
+    instruction=_story_writer_instruction,
     output_schema=StoryPlan,
     after_model_callback=_writer_after_model,
     before_agent_callback=_on_writer_start,
@@ -408,12 +795,44 @@ assemble_book_agent = AssembleBookAgent(
 )
 
 
-root_agent = SequentialAgent(
-    name="book_maker_root_agent",
+book_build_pipeline = SequentialAgent(
+    name="book_build_pipeline",
     description=(
-        "Sequential pipeline: writer, parallel illustrators (5 images), then book assembly."
+        "Writes the story, generates five page illustrations in parallel, then assembles output."
     ),
     sub_agents=[story_writer_agent, parallel_image_agent, assemble_book_agent],
+)
+
+
+class BookMakerHostAgent(BaseAgent):
+    """Collects theme + brief from the user, then runs the illustration pipeline."""
+
+    @override
+    async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
+        tc = Context(ctx)
+        user_text = _user_text_from_content(ctx.user_content)
+        ready, reply = await _apply_intake_from_message(tc, user_text)
+        if not ready:
+            tc.state["pipeline_progress"] = "Waiting for your theme and brief story idea."
+            yield Event(
+                invocation_id=ctx.invocation_id,
+                author=self.name,
+                branch=ctx.branch,
+                content=types.Content(role="model", parts=[types.Part(text=reply)]),
+                actions=tc.actions,
+            )
+            return
+
+        async with Aclosing(book_build_pipeline.run_async(ctx)) as agen:
+            async for event in agen:
+                yield event
+
+
+root_agent = BookMakerHostAgent(
+    name="book_maker_root_agent",
+    description=(
+        "Asks for a theme and brief story idea, then builds a 5-page illustrated storybook."
+    ),
 )
 
 
